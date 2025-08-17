@@ -22,7 +22,7 @@ class GeneralListener:
         self.interface = None
         self.my_node_id = None
         self.log_file = log_file
-        self.script_version = "1.3.0"  # Updated for auto-recovery improvements
+        self.script_version = "1.3.1"  # Updated for auto-recovery improvements
         self.max_retries = 5
         self.retry_delay = 30  # seconds
         self.reconnect_attempts = 0
@@ -408,7 +408,8 @@ class GeneralListener:
                 "original_message": text_content,
                 "reply_sent": reply_text,
                 "reply_to_node": sender_id,
-                "auto_reply_triggered": True
+                "auto_reply_triggered": True,
+                "success": True
             }
             
             # Create comprehensive log entry for outbound auto-reply
@@ -442,7 +443,65 @@ class GeneralListener:
             print(json.dumps(json_safe_outbound, indent=2))
             
         except Exception as e:
+            # Comprehensive auto-reply failure logging
+            error_timestamp = datetime.now().isoformat()
+            error_message = str(e)
+            
             print(f"Failed to send auto-reply: {e}")
+            self.log_error(f"Auto-reply failed to {sender_id}: {error_message}")
+            
+            # Determine error type for better analysis
+            error_type = "UNKNOWN_ERROR"
+            network_related = False
+            connection_related = False
+            
+            if "WinError 10054" in error_message or "connection" in error_message.lower():
+                error_type = "CONNECTION_ERROR"
+                connection_related = True
+                network_related = True
+            elif "network" in error_message.lower() or "timeout" in error_message.lower():
+                error_type = "NETWORK_ERROR"
+                network_related = True
+            elif "permission" in error_message.lower() or "access" in error_message.lower():
+                error_type = "PERMISSION_ERROR"
+            elif "interface" in error_message.lower():
+                error_type = "INTERFACE_ERROR"
+                connection_related = True
+            elif "node" in error_message.lower() or "destination" in error_message.lower():
+                error_type = "NODE_UNREACHABLE"
+                network_related = True
+            
+            # Log comprehensive failure details
+            failure_log = {
+                "timestamp": error_timestamp,
+                "event_type": "AUTO_REPLY_FAILED",
+                "direction": "outbound_failed",
+                "source_channel": "radio",
+                "script_version": self.script_version,
+                "from_node": self.my_node_id,
+                "to_node": sender_id,
+                "intended_message": reply_text,
+                "original_message": text_content,
+                "error_message": error_message,
+                "error_type": error_type,
+                "network_related": network_related,
+                "connection_related": connection_related,
+                "connection_type": self.connection_type,
+                "interface_status": hasattr(self.interface, 'isConnected') and self.interface.isConnected if self.interface else False,
+                "processing_timestamp_unix": time.time(),
+                "my_node_id": self.my_node_id,
+                "failure_details": {
+                    "attempted_reply": reply_text,
+                    "target_node": sender_id,
+                    "reply_length": len(reply_text),
+                    "error_class": type(e).__name__,
+                    "recovery_possible": connection_related or network_related
+                }
+            }
+            
+            self.save_to_file(failure_log)
+            json_safe_failure = self.make_json_safe(failure_log)
+            print(json.dumps(json_safe_failure, indent=2))
 
     def handle_packet_internal(self, packet):
         """Internal packet handler that catches all packets"""

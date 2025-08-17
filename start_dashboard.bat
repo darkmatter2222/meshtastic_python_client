@@ -6,5 +6,6 @@ echo.
 echo Dashboard will be available at: http://localhost:8501
 echo.
 call .venv\Scripts\activate.bat
+pip install -r requirements.txt
 streamlit run meshtastic_dashboard.py
 pause
