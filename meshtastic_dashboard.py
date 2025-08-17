@@ -67,16 +67,21 @@ def create_metric_with_info(label, value, info_text, delta=None):
         if st.button("ℹ️", key=f"info_{label.replace(' ', '_').replace('/', '_')}", help="Click for details"):
             st.info(info_text)
 
-def calculate_channel_utilization(df):
-    """Calculate channel utilization and airtime metrics"""
+def calculate_channel_utilization(df, start_time=None, end_time=None):
+    """Calculate channel utilization and airtime metrics for selected timeframe"""
     if df.empty:
         return {}
     
-    # Calculate time window
-    if 'timestamp' in df.columns and len(df) > 1:
+    # Calculate time window - use actual selected timeframe if provided
+    if start_time and end_time:
+        time_span = (pd.to_datetime(end_time) - pd.to_datetime(start_time)).total_seconds()
+    elif 'timestamp' in df.columns and len(df) > 1:
         time_span = (df['timestamp'].max() - df['timestamp'].min()).total_seconds()
     else:
         time_span = 3600  # Default 1 hour
+    
+    # Ensure minimum time span to avoid division by zero
+    time_span = max(time_span, 60)  # At least 1 minute
     
     # Calculate metrics
     total_packets = len(df)
@@ -944,8 +949,222 @@ def main():
             st.rerun()
         return
     
-    # Calculate channel utilization KPIs
-    channel_metrics = calculate_channel_utilization(df)
+    # Temporal Controls
+    st.header("⏰ Time Range Controls")
+    
+    # Add a quick preset selector at the top
+    st.subheader("Quick Time Presets")
+    col_preset1, col_preset2, col_preset3, col_preset4, col_preset5 = st.columns(5)
+    
+    with col_preset1:
+        if st.button("📍 Last Hour", use_container_width=True):
+            st.session_state.time_start = (max_time - pd.Timedelta(hours=1)).to_pydatetime()
+            st.session_state.time_end = max_time.to_pydatetime()
+            st.rerun()
+    
+    with col_preset2:
+        if st.button("🕕 Last 6 Hours", use_container_width=True):
+            st.session_state.time_start = (max_time - pd.Timedelta(hours=6)).to_pydatetime()
+            st.session_state.time_end = max_time.to_pydatetime()
+            st.rerun()
+    
+    with col_preset3:
+        if st.button("🕒 Last 12 Hours", use_container_width=True):
+            st.session_state.time_start = (max_time - pd.Timedelta(hours=12)).to_pydatetime()
+            st.session_state.time_end = max_time.to_pydatetime()
+            st.rerun()
+    
+    with col_preset4:
+        if st.button("📅 Last 24 Hours", use_container_width=True):
+            st.session_state.time_start = (max_time - pd.Timedelta(hours=24)).to_pydatetime()
+            st.session_state.time_end = max_time.to_pydatetime()
+            st.rerun()
+    
+    with col_preset5:
+        if st.button("🗂️ All Data", use_container_width=True):
+            st.session_state.time_start = min_time.to_pydatetime()
+            st.session_state.time_end = max_time.to_pydatetime()
+            st.rerun()
+    
+    st.subheader("Custom Time Range")
+    
+    # Get the data time range
+    if 'timestamp' in df.columns and not df['timestamp'].isnull().all():
+        min_time = df['timestamp'].min()
+        max_time = df['timestamp'].max()
+        
+        # Initialize session state for time range if not exists
+        if 'time_start' not in st.session_state:
+            # Default to last 12 hours or full range if less than 12 hours
+            now = max_time
+            twelve_hours_ago = now - pd.Timedelta(hours=12)
+            st.session_state.time_start = max(min_time, twelve_hours_ago).to_pydatetime()
+        
+        if 'time_end' not in st.session_state:
+            st.session_state.time_end = max_time.to_pydatetime()
+        
+        col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
+        
+        with col1:
+            # Use a more user-friendly approach with just date selection and hour sliders
+            start_date = st.date_input(
+                "Start Date",
+                value=st.session_state.time_start.date(),
+                min_value=min_time.date(),
+                max_value=max_time.date(),
+                help="Select the start date for analysis"
+            )
+            start_hour = st.slider(
+                "Start Hour", 
+                min_value=0, 
+                max_value=23, 
+                value=st.session_state.time_start.hour,
+                format="%d:00"
+            )
+            start_time = datetime.datetime.combine(start_date, datetime.time(start_hour, 0))
+        
+        with col2:
+            end_date = st.date_input(
+                "End Date",
+                value=st.session_state.time_end.date(),
+                min_value=min_time.date(),
+                max_value=max_time.date(),
+                help="Select the end date for analysis"
+            )
+            end_hour = st.slider(
+                "End Hour", 
+                min_value=0, 
+                max_value=23, 
+                value=st.session_state.time_end.hour,
+                format="%d:00"
+            )
+            end_time = datetime.datetime.combine(end_date, datetime.time(end_hour, 59, 59))
+        
+        # Update session state when values change
+        st.session_state.time_start = start_time
+        st.session_state.time_end = end_time
+        
+        # Show current selection status
+        time_span_selected = pd.to_datetime(end_time) - pd.to_datetime(start_time)
+        hours_selected = time_span_selected.total_seconds() / 3600
+        
+        if hours_selected < 1:
+            time_desc = f"{time_span_selected.total_seconds()/60:.0f} minutes"
+        elif hours_selected < 24:
+            time_desc = f"{hours_selected:.1f} hours"
+        else:
+            time_desc = f"{hours_selected/24:.1f} days"
+        
+        st.info(f"🕐 Currently analyzing: **{time_desc}** of data "
+               f"({start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')})")
+        
+        with col3:
+            # Data range info
+            st.write("**Data Available:**")
+            st.write(f"From: {min_time.strftime('%Y-%m-%d %H:%M')}")
+            st.write(f"To: {max_time.strftime('%Y-%m-%d %H:%M')}")
+        
+        with col4:
+            # Current selection summary
+            st.write("**Selection Summary:**")
+            st.write(f"Duration: {time_desc}")
+            data_points = len(df)
+            st.write(f"Data Points: {data_points:,}")
+        
+        # Convert back to pandas datetime for filtering
+        start_timestamp = pd.to_datetime(start_time)
+        end_timestamp = pd.to_datetime(end_time)
+        
+        # Validate time range
+        if start_timestamp >= end_timestamp:
+            st.error("⚠️ Start time must be before end time. Please adjust your selection.")
+            return
+        
+        # Filter dataframe based on selected time range
+        original_count = len(df)
+        df = df[(df['timestamp'] >= start_timestamp) & (df['timestamp'] <= end_timestamp)]
+        filtered_count = len(df)
+        
+        # Show filtering info with more detail
+        coverage_pct = (filtered_count / original_count * 100) if original_count > 0 else 0
+        if filtered_count < original_count:
+            st.success(f"📊 Filtered to {filtered_count:,} packets from {original_count:,} total "
+                      f"({coverage_pct:.1f}% of dataset)")
+        else:
+            st.success(f"📊 Showing all {filtered_count:,} packets in dataset")
+        
+        # Check if filtered data is empty
+        if df.empty:
+            st.warning("⚠️ No data available in selected time range. Please adjust the time filter.")
+            return
+    
+    else:
+        st.warning("⚠️ No timestamp data available for temporal filtering.")
+    
+    st.divider()  # Visual separator
+    
+    # Calculate channel utilization KPIs with timeframe context
+    if 'timestamp' in df.columns and not df['timestamp'].isnull().all():
+        channel_metrics = calculate_channel_utilization(df, start_time, end_time)
+        
+        # Temporal Summary Section
+        st.header("📅 Selected Time Period Summary")
+        col1, col2, col3, col4, col5 = st.columns(5)
+        
+        with col1:
+            time_span_hours = (pd.to_datetime(end_time) - pd.to_datetime(start_time)).total_seconds() / 3600
+            create_metric_with_info(
+                "Time Window", 
+                f"{time_span_hours:.1f}h",
+                f"Selected analysis window from {start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')}. All metrics below are calculated for this specific period."
+            )
+        
+        with col2:
+            packets_in_period = len(df)
+            create_metric_with_info(
+                "Packets in Period", 
+                f"{packets_in_period:,}",
+                "Total number of packets captured during the selected time window. Higher values indicate more network activity."
+            )
+        
+        with col3:
+            if packets_in_period > 0 and time_span_hours > 0:
+                packets_per_hour = packets_in_period / time_span_hours
+                create_metric_with_info(
+                    "Activity Rate", 
+                    f"{packets_per_hour:.0f}/h",
+                    "Average packets per hour during the selected period. Shows network activity intensity."
+                )
+        
+        with col4:
+            if 'timestamp' in df.columns and len(df) > 1:
+                first_packet = df['timestamp'].min()
+                last_packet = df['timestamp'].max()
+                actual_span = (last_packet - first_packet).total_seconds() / 3600
+                coverage_pct = (actual_span / time_span_hours * 100) if time_span_hours > 0 else 0
+                
+                # Calculate data density (packets per active hour)
+                density = packets_in_period / actual_span if actual_span > 0 else 0
+                
+                create_metric_with_info(
+                    "Data Coverage", 
+                    f"{coverage_pct:.0f}%",
+                    f"Percentage of selected time window with actual data. 100% means continuous activity from {first_packet.strftime('%H:%M')} to {last_packet.strftime('%H:%M')}. Lower values indicate gaps or periods of no traffic. Data density: {density:.0f} packets/active hour."
+                )
+        
+        with col5:
+            if 'source_channel' in df.columns:
+                unique_channels = df['source_channel'].nunique()
+                create_metric_with_info(
+                    "Active Channels", 
+                    f"{unique_channels}",
+                    "Number of different communication channels (radio, MQTT, etc.) active during the selected period."
+                )
+        
+        st.divider()
+        
+    else:
+        channel_metrics = calculate_channel_utilization(df)
     
     # Channel Utilization and Airtime KPIs
     st.header("📡 Channel Utilization & Airtime KPIs")

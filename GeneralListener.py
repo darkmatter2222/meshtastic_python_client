@@ -17,47 +17,139 @@ import meshtastic.tcp_interface
 class GeneralListener:
     def __init__(self, connection_type, port_or_host=None, auto_reply=False, log_file="meshtastic_traffic.json"):
         self.connection_type = connection_type
+        self.port_or_host = port_or_host
         self.auto_reply = auto_reply
         self.interface = None
         self.my_node_id = None
         self.log_file = log_file
-        self.script_version = "1.2.0"  # Version for tracking analytics improvements
+        self.script_version = "1.3.0"  # Updated for auto-recovery improvements
+        self.max_retries = 5
+        self.retry_delay = 30  # seconds
+        self.reconnect_attempts = 0
         
         # Initialize log file with session start marker
         self.log_session_start()
         
-        # Connect to device
-        if connection_type == "serial":
-            if port_or_host:
-                print(f"Connecting to serial port: {port_or_host}")
-                self.interface = meshtastic.serial_interface.SerialInterface(
-                    devPath=port_or_host
-                )
-            else:
-                print("Auto-detecting serial port...")
-                self.interface = meshtastic.serial_interface.SerialInterface()
-        else:  # tcp
-            host = port_or_host or "meshtastic.local"
-            print(f"Connecting to TCP host: {host}")
-            self.interface = meshtastic.tcp_interface.TCPInterface(hostname=host)
+        # Connect to device with auto-recovery
+        self.connect_with_retry()
+
+    def log_error(self, error_type, error_message, retry_attempt=None):
+        """Log errors and connection issues"""
+        error_log = {
+            "timestamp": datetime.now().isoformat(),
+            "event_type": "ERROR",
+            "error_type": error_type,
+            "error_message": str(error_message),
+            "script_version": self.script_version,
+            "connection_type": self.connection_type,
+            "retry_attempt": retry_attempt,
+            "max_retries": self.max_retries
+        }
+        self.save_to_file(error_log)
+        print(f"ERROR LOGGED: {error_type} - {error_message}")
+
+    def connect_with_retry(self):
+        """Connect to device with retry logic"""
+        for attempt in range(self.max_retries):
+            try:
+                self.reconnect_attempts = attempt + 1
+                print(f"Connection attempt {self.reconnect_attempts}/{self.max_retries}")
+                
+                # Connect to device
+                if self.connection_type == "serial":
+                    if self.port_or_host:
+                        print(f"Connecting to serial port: {self.port_or_host}")
+                        self.interface = meshtastic.serial_interface.SerialInterface(
+                            devPath=self.port_or_host
+                        )
+                    else:
+                        print("Auto-detecting serial port...")
+                        self.interface = meshtastic.serial_interface.SerialInterface()
+                else:  # tcp
+                    host = self.port_or_host or "meshtastic.local"
+                    print(f"Connecting to TCP host: {host}")
+                    self.interface = meshtastic.tcp_interface.TCPInterface(hostname=host)
+                
+                # Get our node ID
+                self.my_node_id = None
+                try:
+                    if hasattr(self.interface, 'myInfo') and self.interface.myInfo:
+                        self.my_node_id = self.interface.myInfo.my_node_num
+                        print(f"Connected! My node ID: {self.my_node_id}")
+                    else:
+                        print("Connected! (Node ID will be detected from packets)")
+                except Exception as e:
+                    print("Connected! (Node ID will be detected from packets)")
+                
+                # Set up callbacks
+                self.interface.onReceive = self.on_receive
+                
+                # CRITICAL: Override internal packet handler to catch all packets
+                if hasattr(self.interface, '_handlePacketFromRadio'):
+                    original_handle_packet = self.interface._handlePacketFromRadio
+                    
+                    def enhanced_packet_handler(packet):
+                        try:
+                            # Call our handler first
+                            self.handle_packet_internal(packet)
+                            # Then call original handler
+                            original_handle_packet(packet)
+                        except Exception as e:
+                            self.log_error("PACKET_HANDLER_ERROR", str(e))
+                    
+                    self.interface._handlePacketFromRadio = enhanced_packet_handler
+                    print("Enhanced packet handler installed")
+                
+                # Log successful connection
+                connection_log = {
+                    "timestamp": datetime.now().isoformat(),
+                    "event_type": "CONNECTION_ESTABLISHED",
+                    "connection_type": self.connection_type,
+                    "host_or_port": self.port_or_host,
+                    "attempt_number": attempt + 1,
+                    "script_version": self.script_version
+                }
+                self.save_to_file(connection_log)
+                print("Connection successful!")
+                return  # Success, exit retry loop
+                
+            except Exception as e:
+                self.log_error("CONNECTION_FAILED", str(e), attempt + 1)
+                if attempt < self.max_retries - 1:
+                    print(f"Connection failed, retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                else:
+                    print("Max connection attempts reached. Exiting.")
+                    raise Exception(f"Failed to connect after {self.max_retries} attempts: {e}")
+
+    def reconnect(self):
+        """Attempt to reconnect after connection loss"""
+        print("Connection lost! Attempting to reconnect...")
         
-        # Get our node ID
-        self.my_node_id = None
+        # Close existing connection
+        if self.interface:
+            try:
+                self.interface.close()
+            except:
+                pass
+            self.interface = None
+        
+        # Log disconnection
+        disconnect_log = {
+            "timestamp": datetime.now().isoformat(),
+            "event_type": "CONNECTION_LOST",
+            "connection_type": self.connection_type,
+            "script_version": self.script_version
+        }
+        self.save_to_file(disconnect_log)
+        
+        # Attempt reconnection
         try:
-            if hasattr(self.interface, 'myInfo') and self.interface.myInfo:
-                self.my_node_id = self.interface.myInfo.my_node_num
-                print(f"Connected! My node ID: {self.my_node_id}")
-            else:
-                print("Connected! (Node ID will be detected from packets)")
-        except:
-            print("Connected! (Node ID will be detected from packets)")
-        
-        # Set up callbacks
-        self.interface.onReceive = self.on_receive
-        
-        # CRITICAL: Override internal packet handler to catch all packets
-        if hasattr(self.interface, '_handlePacketFromRadio'):
-            original_handle_packet = self.interface._handlePacketFromRadio
+            self.connect_with_retry()
+            return True
+        except Exception as e:
+            self.log_error("RECONNECTION_FAILED", str(e))
+            return False
             
             def enhanced_handle_packet(packet):
                 # Call our packet handler first
@@ -386,10 +478,43 @@ class GeneralListener:
         # The internal handler will process this packet
 
     def listen(self):
-        """Start listening loop"""
+        """Start listening loop with auto-recovery"""
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
         try:
             while True:
-                time.sleep(1)
+                try:
+                    # Check if interface is still connected
+                    if not self.interface or not hasattr(self.interface, 'isConnected') or not self.interface.isConnected:
+                        print("Connection lost, attempting to reconnect...")
+                        self.log_error("Connection lost during listen loop")
+                        if not self.reconnect():
+                            print("Failed to reconnect, retrying in 30 seconds...")
+                            time.sleep(30)
+                            continue
+                    
+                    # Reset error counter on successful operation
+                    consecutive_errors = 0
+                    time.sleep(1)
+                    
+                except (OSError, ConnectionError, Exception) as e:
+                    consecutive_errors += 1
+                    error_msg = f"Error in listen loop (attempt {consecutive_errors}): {e}"
+                    print(error_msg)
+                    self.log_error(error_msg)
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        self.log_error(f"Too many consecutive errors ({max_consecutive_errors}), giving up")
+                        break
+                    
+                    # Try to reconnect
+                    if not self.reconnect():
+                        print(f"Reconnection failed, waiting {30} seconds before retry...")
+                        time.sleep(30)
+                    else:
+                        consecutive_errors = 0  # Reset on successful reconnection
+                        
         except KeyboardInterrupt:
             print("\nShutting down...")
             # Log session end
@@ -403,14 +528,17 @@ class GeneralListener:
             self.save_to_file(session_end)
         finally:
             if self.interface:
-                self.interface.close()
+                try:
+                    self.interface.close()
+                except:
+                    pass  # Ignore errors during cleanup
 
 
 def main():
     # Simple configuration - edit these values as needed
     CONNECTION_TYPE = "tcp"  # "serial" or "tcp"
     PORT_OR_HOST = "meshtastic.local"        # None for auto-detect, or specify port/host
-    AUTO_REPLY = False          # Enable auto-reply
+    AUTO_REPLY = True          # Enable auto-reply
     LOG_FILE = "meshtastic_traffic.json"  # Log file for all packets
     
     print(f"Starting Meshtastic listener...")
