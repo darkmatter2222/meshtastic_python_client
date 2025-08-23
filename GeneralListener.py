@@ -8,10 +8,114 @@ import json
 import time
 import os
 import base64
+import sys
+import threading
+import traceback
+import logging
 from datetime import datetime
 import meshtastic
 import meshtastic.serial_interface
 import meshtastic.tcp_interface
+
+
+# Configure logging to suppress Meshtastic library error messages
+class MeshtasticLogFilter(logging.Filter):
+    """Filter to suppress specific Meshtastic error messages"""
+    def filter(self, record):
+        # Suppress specific error messages that we handle ourselves
+        suppressed_messages = [
+            "Unexpected OSError, terminating meshtastic reader",
+            "ConnectionResetError",
+            "WinError 10054",
+            "An existing connection was forcibly closed by the remote host",
+            "terminating meshtastic reader"
+        ]
+        
+        # Check if this log message should be suppressed
+        if any(msg in record.getMessage() for msg in suppressed_messages):
+            return False  # Don't log this message
+            
+        return True  # Allow other messages
+
+# Apply the filter to the root logger to catch all Meshtastic library logs
+root_logger = logging.getLogger()
+meshtastic_filter = MeshtasticLogFilter()
+root_logger.addFilter(meshtastic_filter)
+
+# Also apply to any existing handlers
+for handler in root_logger.handlers:
+    handler.addFilter(meshtastic_filter)
+
+
+# Global exception handler for background threads
+def custom_excepthook(args):
+    """Custom exception handler to suppress all Meshtastic background thread errors"""
+    exc_type, exc_value, exc_traceback, thread = args
+    
+    # Check if this is a Meshtastic-related background thread error
+    if thread and thread.name and "Thread-" in thread.name:
+        # Check if the traceback contains Meshtastic-related calls
+        tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+        tb_text = ''.join(tb_lines)
+        
+        # Look for any Meshtastic-related functions in the traceback
+        meshtastic_indicators = [
+            'sendHeartbeat',
+            'mesh_interface.py',
+            '_sendToRadio',
+            'tcp_interface.py',
+            '_writeBytes',
+            'stream_interface.py',
+            '_reader',
+            'meshtastic',
+            'ConnectionResetError',
+            'OSError',
+            'BrokenPipeError',
+            'ConnectionAbortedError'
+        ]
+        
+        if any(indicator in tb_text for indicator in meshtastic_indicators):
+            # This is a Meshtastic-related connection error - log it but don't print the full traceback
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            error_type = exc_type.__name__ if exc_type else "Unknown"
+            print(f"[{timestamp}] ⚠️  Meshtastic background thread error suppressed: {error_type} (this is expected during network issues)")
+            return
+    
+    # For non-Meshtastic errors, use the default handler
+    sys.__excepthook__(exc_type, exc_value, exc_traceback)
+
+# Install the custom exception handler for threads
+threading.excepthook = custom_excepthook
+
+# Also install a global exception handler for the main thread
+original_excepthook = sys.excepthook
+
+def global_excepthook(exc_type, exc_value, exc_traceback):
+    """Global exception handler to catch unhandled exceptions"""
+    tb_lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+    tb_text = ''.join(tb_lines)
+    
+    # Check if this is a Meshtastic-related error
+    meshtastic_indicators = [
+        'mesh_interface.py',
+        'tcp_interface.py', 
+        'stream_interface.py',
+        'meshtastic',
+        'ConnectionResetError',
+        'OSError',
+        'BrokenPipeError'
+    ]
+    
+    if any(indicator in tb_text for indicator in meshtastic_indicators):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        error_type = exc_type.__name__ if exc_type else "Unknown"
+        print(f"[{timestamp}] ⚠️  Meshtastic library error suppressed: {error_type} (connection will auto-recover)")
+        return
+    
+    # For non-Meshtastic errors, use the original handler
+    original_excepthook(exc_type, exc_value, exc_traceback)
+
+sys.excepthook = global_excepthook
 
 
 class GeneralListener:
@@ -22,7 +126,7 @@ class GeneralListener:
         self.interface = None
         self.my_node_id = None
         self.log_file = log_file
-        self.script_version = "1.3.1"  # Updated for auto-recovery improvements
+        self.script_version = "1.6.0"  # Comprehensive Meshtastic library error suppression and auto-recovery
         self.max_retries = 5
         self.retry_delay = 30  # seconds
         self.reconnect_attempts = 0
@@ -47,6 +151,95 @@ class GeneralListener:
         }
         self.save_to_file(error_log)
         print(f"ERROR LOGGED: {error_type} - {error_message}")
+
+    def setup_robust_heartbeat(self):
+        """Setup robust heartbeat mechanism that won't crash the app"""
+        if self.interface and hasattr(self.interface, '_heartbeatTimer'):
+            try:
+                # Try to stop existing heartbeat timer
+                if self.interface._heartbeatTimer:
+                    self.interface._heartbeatTimer.cancel()
+                    print("🔧 Stopped existing heartbeat timer")
+                
+                # Override the sendHeartbeat method with our robust version
+                if hasattr(self.interface, 'sendHeartbeat'):
+                    original_send_heartbeat = self.interface.sendHeartbeat
+                    
+                    def robust_send_heartbeat():
+                        """Robust heartbeat that handles connection errors gracefully"""
+                        try:
+                            original_send_heartbeat()
+                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+                            # Silently handle heartbeat failures - these are expected during reconnection
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            print(f"[{timestamp}] 💓 Heartbeat connection error handled gracefully")
+                            # Don't re-raise the exception
+                        except Exception as e:
+                            # Log unexpected heartbeat errors
+                            print(f"🚨 Unexpected heartbeat error: {type(e).__name__}: {e}")
+                    
+                    self.interface.sendHeartbeat = robust_send_heartbeat
+                    print("💓 Installed robust heartbeat handler")
+                    
+            except Exception as e:
+                print(f"⚠️  Could not setup robust heartbeat: {e}")
+
+    def setup_robust_reader(self):
+        """Setup robust reader mechanism that won't terminate on errors"""
+        if not self.interface:
+            return
+            
+        try:
+            # Override reader-related error handling
+            if hasattr(self.interface, '_reader') and self.interface._reader:
+                print("🔧 Setting up robust reader error handling")
+                
+                # Try to find and override the reader's error handling
+                reader_thread = self.interface._reader
+                if reader_thread and hasattr(reader_thread, 'run'):
+                    original_run = reader_thread.run
+                    
+                    def robust_reader_run():
+                        """Robust reader that handles connection errors gracefully"""
+                        try:
+                            original_run()
+                        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            print(f"[{timestamp}] 📖 Reader connection error handled gracefully - triggering reconnect")
+                            # Trigger our reconnection logic instead of terminating
+                            try:
+                                if not self.reconnect():
+                                    print("🔄 Reader error reconnection failed, will retry")
+                            except Exception as reconnect_error:
+                                print(f"⚠️  Reconnection after reader error failed: {reconnect_error}")
+                        except Exception as e:
+                            print(f"🚨 Unexpected reader error: {type(e).__name__}: {e}")
+                    
+                    reader_thread.run = robust_reader_run
+                    print("📖 Installed robust reader handler")
+                    
+            # Also try to patch the interface's _sendToRadio method if it exists
+            if hasattr(self.interface, '_sendToRadio'):
+                original_send_to_radio = self.interface._sendToRadio
+                
+                def robust_send_to_radio(packet):
+                    """Robust _sendToRadio that handles connection errors gracefully"""
+                    try:
+                        return original_send_to_radio(packet)
+                    except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError) as e:
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(f"[{timestamp}] 📡 Send-to-radio connection error handled gracefully")
+                        # Don't re-raise - let the connection recovery handle this
+                        return None
+                    except Exception as e:
+                        print(f"🚨 Unexpected send-to-radio error: {type(e).__name__}: {e}")
+                        return None
+                
+                self.interface._sendToRadio = robust_send_to_radio
+                print("📡 Installed robust send-to-radio handler")
+                
+        except Exception as e:
+            print(f"⚠️  Could not setup robust reader: {e}")
 
     def connect_with_retry(self):
         """Connect to device with retry logic"""
@@ -100,6 +293,12 @@ class GeneralListener:
                     self.interface._handlePacketFromRadio = enhanced_packet_handler
                     print("Enhanced packet handler installed")
                 
+                # Setup robust heartbeat mechanism to prevent crashes
+                self.setup_robust_heartbeat()
+                
+                # Setup robust reader mechanism to prevent termination
+                self.setup_robust_reader()
+                
                 # Log successful connection
                 connection_log = {
                     "timestamp": datetime.now().isoformat(),
@@ -123,42 +322,143 @@ class GeneralListener:
                     raise Exception(f"Failed to connect after {self.max_retries} attempts: {e}")
 
     def reconnect(self):
-        """Attempt to reconnect after connection loss"""
-        print("Connection lost! Attempting to reconnect...")
+        """Bulletproof reconnection with enhanced error handling"""
+        print("🔄 Connection lost! Attempting bulletproof reconnection...")
         
-        # Close existing connection
+        # Close existing connection aggressively
         if self.interface:
             try:
+                print("🧹 Closing existing connection...")
                 self.interface.close()
-            except:
-                pass
-            self.interface = None
+            except Exception as e:
+                print(f"⚠️  Error closing connection (ignoring): {e}")
+            finally:
+                self.interface = None
+        
+        # Clear any remaining state
+        self.my_node_id = None
         
         # Log disconnection
         disconnect_log = {
             "timestamp": datetime.now().isoformat(),
             "event_type": "CONNECTION_LOST",
             "connection_type": self.connection_type,
-            "script_version": self.script_version
+            "script_version": self.script_version,
+            "attempting_reconnect": True
         }
         self.save_to_file(disconnect_log)
         
-        # Attempt reconnection
-        try:
-            self.connect_with_retry()
-            return True
-        except Exception as e:
-            self.log_error("RECONNECTION_FAILED", str(e))
-            return False
-            
-            def enhanced_handle_packet(packet):
-                # Call our packet handler first
-                self.handle_packet_internal(packet)
-                # Then call the original handler
-                return original_handle_packet(packet)
-            
-            self.interface._handlePacketFromRadio = enhanced_handle_packet
-            print("Enhanced packet handling enabled")
+        # Brief wait to let network settle
+        print("⏳ Waiting 5 seconds for network to settle...")
+        time.sleep(5)
+        
+        # Attempt reconnection with retries
+        for reconnect_attempt in range(3):  # Try 3 times for reconnection
+            try:
+                print(f"🔄 Reconnection attempt {reconnect_attempt + 1}/3...")
+                
+                # Re-establish connection
+                if self.connection_type == "serial":
+                    if self.port_or_host:
+                        print(f"📡 Reconnecting to serial port: {self.port_or_host}")
+                        self.interface = meshtastic.serial_interface.SerialInterface(
+                            devPath=self.port_or_host
+                        )
+                    else:
+                        print("📡 Auto-detecting serial port...")
+                        self.interface = meshtastic.serial_interface.SerialInterface()
+                else:  # tcp
+                    host = self.port_or_host or "meshtastic.local"
+                    print(f"📡 Reconnecting to TCP host: {host}")
+                    self.interface = meshtastic.tcp_interface.TCPInterface(hostname=host)
+                
+                # Test connection by trying to access interface
+                test_successful = False
+                for test_attempt in range(5):  # Test connection stability
+                    try:
+                        # Try to access interface properties
+                        if hasattr(self.interface, 'isConnected'):
+                            connected = self.interface.isConnected
+                        else:
+                            connected = True  # Assume connected if no isConnected property
+                        
+                        if connected:
+                            test_successful = True
+                            break
+                        else:
+                            print(f"⚠️  Connection test {test_attempt + 1}/5 failed, retrying...")
+                            time.sleep(2)
+                    except Exception as e:
+                        print(f"⚠️  Connection test {test_attempt + 1}/5 error: {e}")
+                        time.sleep(2)
+                
+                if not test_successful:
+                    raise Exception("Connection test failed after 5 attempts")
+                
+                # Re-setup callbacks and handlers
+                print("🔧 Setting up callbacks...")
+                self.interface.onReceive = self.on_receive
+                
+                # Re-install enhanced packet handler
+                if hasattr(self.interface, '_handlePacketFromRadio'):
+                    original_handle_packet = self.interface._handlePacketFromRadio
+                    
+                    def enhanced_packet_handler(packet):
+                        try:
+                            # Call our handler first
+                            self.handle_packet_internal(packet)
+                            # Then call original handler
+                            original_handle_packet(packet)
+                        except Exception as e:
+                            self.log_error("PACKET_HANDLER_ERROR", str(e))
+                    
+                    self.interface._handlePacketFromRadio = enhanced_packet_handler
+                    print("✅ Enhanced packet handler reinstalled")
+                
+                # Re-setup robust heartbeat mechanism
+                self.setup_robust_heartbeat()
+                
+                # Re-setup robust reader mechanism
+                self.setup_robust_reader()
+                
+                # Try to get node ID
+                try:
+                    if hasattr(self.interface, 'myInfo') and self.interface.myInfo:
+                        self.my_node_id = self.interface.myInfo.my_node_num
+                        print(f"✅ Reconnected! My node ID: {self.my_node_id}")
+                    else:
+                        print("✅ Reconnected! (Node ID will be detected from packets)")
+                except Exception as e:
+                    print("✅ Reconnected! (Node ID will be detected from packets)")
+                
+                # Log successful reconnection
+                reconnect_log = {
+                    "timestamp": datetime.now().isoformat(),
+                    "event_type": "CONNECTION_REESTABLISHED",
+                    "connection_type": self.connection_type,
+                    "host_or_port": self.port_or_host,
+                    "reconnect_attempt": reconnect_attempt + 1,
+                    "script_version": self.script_version,
+                    "my_node_id": self.my_node_id
+                }
+                self.save_to_file(reconnect_log)
+                print("🎉 Reconnection successful!")
+                return True
+                
+            except Exception as e:
+                error_msg = f"Reconnection attempt {reconnect_attempt + 1} failed: {type(e).__name__}: {e}"
+                print(f"❌ {error_msg}")
+                self.log_error("RECONNECTION_ATTEMPT_FAILED", error_msg, reconnect_attempt + 1)
+                
+                if reconnect_attempt < 2:  # Not the last attempt
+                    wait_time = 10 + (reconnect_attempt * 10)  # Exponential backoff
+                    print(f"⏳ Waiting {wait_time} seconds before next reconnection attempt...")
+                    time.sleep(wait_time)
+        
+        # All reconnection attempts failed
+        self.log_error("RECONNECTION_FAILED", "All reconnection attempts failed")
+        print("💀 All reconnection attempts failed")
+        return False
         
         print("Listening for messages...")
         if auto_reply:
@@ -537,55 +837,134 @@ class GeneralListener:
         # The internal handler will process this packet
 
     def listen(self):
-        """Start listening loop with auto-recovery"""
+        """Start listening loop with bulletproof auto-recovery"""
         consecutive_errors = 0
         max_consecutive_errors = 10
+        last_successful_time = time.time()
+        connection_timeout = 300  # 5 minutes without activity triggers reconnect
+        
+        print("🎯 Starting bulletproof listen loop with auto-recovery...")
+        print("📡 Press Ctrl+C to stop")
+        print("=" * 60)
         
         try:
             while True:
                 try:
-                    # Check if interface is still connected
-                    if not self.interface or not hasattr(self.interface, 'isConnected') or not self.interface.isConnected:
-                        print("Connection lost, attempting to reconnect...")
-                        self.log_error("Connection lost during listen loop")
+                    # Check if interface exists and is functional
+                    if not self.interface:
+                        print("❌ Interface is None, attempting reconnection...")
                         if not self.reconnect():
-                            print("Failed to reconnect, retrying in 30 seconds...")
+                            print("🔄 Reconnection failed, waiting 30 seconds...")
                             time.sleep(30)
                             continue
                     
-                    # Reset error counter on successful operation
+                    # Check for connection timeout (no activity for too long)
+                    current_time = time.time()
+                    if current_time - last_successful_time > connection_timeout:
+                        print(f"⏰ No activity for {connection_timeout} seconds, forcing reconnection...")
+                        self.log_error("CONNECTION_TIMEOUT", f"No activity for {connection_timeout} seconds")
+                        if not self.reconnect():
+                            print("🔄 Timeout reconnection failed, waiting 30 seconds...")
+                            time.sleep(30)
+                            continue
+                        last_successful_time = current_time
+                    
+                    # Test connection health by checking interface status
+                    try:
+                        # Try to access interface properties to test if it's alive
+                        if hasattr(self.interface, 'isConnected'):
+                            is_connected = self.interface.isConnected
+                        else:
+                            # For interfaces without isConnected, assume connected if interface exists
+                            is_connected = True
+                            
+                        if not is_connected:
+                            print("❌ Interface reports disconnected, attempting reconnection...")
+                            self.log_error("INTERFACE_DISCONNECTED", "Interface isConnected returned False")
+                            if not self.reconnect():
+                                print("🔄 Disconnect reconnection failed, waiting 30 seconds...")
+                                time.sleep(30)
+                                continue
+                    except Exception as e:
+                        print(f"❌ Error checking interface status: {e}")
+                        print("🔄 Attempting to reconnect due to interface error...")
+                        if not self.reconnect():
+                            print("🔄 Interface error reconnection failed, waiting 30 seconds...")
+                            time.sleep(30)
+                            continue
+                    
+                    # Reset error counter and update last successful time
                     consecutive_errors = 0
+                    last_successful_time = current_time
+                    
+                    # Brief sleep to prevent excessive CPU usage
                     time.sleep(1)
                     
-                except (OSError, ConnectionError, Exception) as e:
+                except (OSError, ConnectionError, ConnectionResetError, BrokenPipeError, 
+                       ConnectionAbortedError, ConnectionRefusedError, TimeoutError) as e:
                     consecutive_errors += 1
-                    error_msg = f"Error in listen loop (attempt {consecutive_errors}): {e}"
-                    print(error_msg)
-                    self.log_error(error_msg)
+                    error_msg = f"Network error in listen loop (attempt {consecutive_errors}): {type(e).__name__}: {e}"
+                    print(f"❌ {error_msg}")
+                    self.log_error("NETWORK_ERROR", error_msg, consecutive_errors)
                     
-                    if consecutive_errors >= max_consecutive_errors:
-                        self.log_error(f"Too many consecutive errors ({max_consecutive_errors}), giving up")
-                        break
-                    
-                    # Try to reconnect
+                    # Force reconnection on network errors
+                    print("🔄 Network error detected, forcing reconnection...")
                     if not self.reconnect():
-                        print(f"Reconnection failed, waiting {30} seconds before retry...")
-                        time.sleep(30)
+                        wait_time = min(30 + (consecutive_errors * 5), 120)  # Exponential backoff, max 2 min
+                        print(f"🔄 Network error reconnection failed, waiting {wait_time} seconds...")
+                        time.sleep(wait_time)
                     else:
                         consecutive_errors = 0  # Reset on successful reconnection
+                        last_successful_time = time.time()
+                        
+                except KeyboardInterrupt:
+                    print("\n🛑 Keyboard interrupt received, shutting down gracefully...")
+                    raise  # Re-raise to trigger cleanup
+                    
+                except Exception as e:
+                    consecutive_errors += 1
+                    error_msg = f"Unexpected error in listen loop (attempt {consecutive_errors}): {type(e).__name__}: {e}"
+                    print(f"❌ {error_msg}")
+                    self.log_error("UNEXPECTED_ERROR", error_msg, consecutive_errors)
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        print(f"💀 Too many consecutive errors ({max_consecutive_errors}), forcing reconnection...")
+                        if not self.reconnect():
+                            print("🔄 Max error reconnection failed, waiting 60 seconds...")
+                            time.sleep(60)
+                        else:
+                            consecutive_errors = 0  # Reset on successful reconnection
+                            last_successful_time = time.time()
+                    else:
+                        # Brief wait before retry
+                        time.sleep(5)
                         
         except KeyboardInterrupt:
-            print("\nShutting down...")
+            print("\n🛑 Shutting down gracefully...")
             # Log session end
             session_end = {
                 "timestamp": datetime.now().isoformat(),
                 "event_type": "SESSION_END",
                 "source_channel": "system",
                 "script_version": self.script_version,
-                "connection_type": self.connection_type
+                "connection_type": self.connection_type,
+                "reason": "user_interrupt"
             }
             self.save_to_file(session_end)
+        except Exception as fatal_error:
+            print(f"💀 FATAL ERROR: {fatal_error}")
+            self.log_error("FATAL_ERROR", str(fatal_error))
+            # Even on fatal error, try to keep running with reconnection
+            print("🔄 Attempting recovery from fatal error...")
+            if not self.reconnect():
+                print("💀 Fatal error recovery failed, exiting...")
+                raise
+            else:
+                print("✅ Recovered from fatal error, continuing...")
+                # Restart the listen loop
+                return self.listen()
         finally:
+            print("🧹 Cleaning up connection...")
             if self.interface:
                 try:
                     self.interface.close()

@@ -2,6 +2,9 @@
 # Core Meshtastic functionality
 meshtastic>=2.3.0
 
+# MQTT streaming
+paho-mqtt>=1.6.0
+
 # Dashboard and Analytics
 streamlit>=1.28.0
 pandas>=2.0.0
