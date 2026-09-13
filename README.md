@@ -1,3 +1,7 @@
+> **☕ Support my work**
+>
+> If this project has helped you, consider supporting my work on [**Buy Me a Coffee**](https://buymeacoffee.com/j6oiubzfnh).
+
 # 📡 Meshtastic Python Analytics Platform
 
 > **Professional-grade monitoring, analytics, and auto-reply system for Meshtastic mesh networks**
